@@ -118,6 +118,16 @@ cat .mcp.json               # should reference `code-review-graph serve`
 
 If `status` shows the graph but `/mcp` in the new session doesn't list `code-review-graph`, the `.mcp.json` isn't in the session's `cwd` — re-run `code-review-graph install` from the correct project root.
 
+### 6. Codex `/review` hangs after installing multiple MCP configs
+
+Codex reads its global `~/.codex/config.toml` and may also load repo-local MCP config files from other tools. If more than one config registers `code-review-graph`, Codex can start duplicate graph MCP servers and stall before dispatching a review tool call.
+
+**Fix:** keep Codex configured globally and remove repo-local graph server entries, or re-run auto-install with a version that skips repo-local MCP configs when Codex is detected:
+
+```bash
+code-review-graph install --platform codex
+```
+
 ---
 
 ## Database lock errors

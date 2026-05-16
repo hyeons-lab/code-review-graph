@@ -62,15 +62,16 @@ class TestResolveRepoRoot:
 class TestServeMainTransport:
     """``main()`` wires FastMCP to stdio or Streamable HTTP."""
 
-    def test_stdio_calls_mcp_run_stdio(self, monkeypatch):
-        calls: list[dict] = []
+    def test_stdio_uses_sync_stdin_transport(self, monkeypatch):
+        calls: list[str] = []
 
-        def fake_run(**kwargs):
-            calls.append(kwargs)
+        def fake_anyio_run(fn):
+            assert fn is crg_main._run_stdio_server
+            calls.append("run")
 
-        monkeypatch.setattr(crg_main.mcp, "run", fake_run)
+        monkeypatch.setattr(crg_main.anyio, "run", fake_anyio_run)
         crg_main.main(repo_root=None)
-        assert calls == [{"transport": "stdio", "show_banner": False}]
+        assert calls == ["run"]
 
     def test_http_calls_mcp_run_with_host_port(self, monkeypatch):
         calls: list[dict] = []
@@ -111,6 +112,10 @@ class TestLongRunningToolsAreAsync:
     HEAVY_TOOLS = {
         "build_or_update_graph_tool",
         "run_postprocess_tool",
+        "get_minimal_context_tool",
+        "get_impact_radius_tool",
+        "get_review_context_tool",
+        "get_affected_flows_tool",
         "embed_graph_tool",
         "detect_changes_tool",
         "generate_wiki_tool",
@@ -307,4 +312,3 @@ class TestApplyToolFilter:
         crg_main._apply_tool_filter(" query_graph_tool , semantic_search_nodes_tool ")
         remaining = await self._tool_names()
         assert remaining == {"query_graph_tool", "semantic_search_nodes_tool"}
-
