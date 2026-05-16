@@ -10,7 +10,7 @@ code-review-graph install    # auto-detects and configures all supported platfor
 code-review-graph build      # parse your codebase
 ```
 
-`install` detects which AI coding tools you have, writes the correct MCP configuration for each one, and installs platform-native hooks where supported. Restart your editor/tool after installing.
+`install` detects which AI coding tools you have, writes the correct MCP configuration, and installs platform-native hooks where supported. If Codex is detected, auto-install configures Codex through `~/.codex/config.toml` and skips Claude Code's repo-local `.mcp.json` to avoid duplicate MCP servers in Codex sessions. Restart your editor/tool after installing.
 
 To target a specific platform instead of auto-detecting all:
 

@@ -16,6 +16,7 @@ import re
 import shutil
 import stat
 import sys
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,8 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "detect": lambda: True,
         "format": "object",
         "needs_type": True,
+        "server_name": "code-review-graph-local",
+        "legacy_server_names": ["code-review-graph"],
     },
     "cursor": {
         "name": "Cursor",
@@ -189,6 +192,24 @@ def _in_uv_project() -> bool:
     return False
 
 
+def _installed_editably() -> bool:
+    """Return True when this package was installed from a local editable checkout."""
+    try:
+        direct_url = metadata.distribution("code-review-graph").read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        return False
+
+    if not direct_url:
+        return False
+
+    try:
+        data = json.loads(direct_url)
+    except json.JSONDecodeError:
+        return False
+
+    return bool(data.get("dir_info", {}).get("editable"))
+
+
 def _detect_serve_command() -> tuple[str, list[str]]:
     """Return ``(command, args)`` that correctly launches ``code-review-graph serve``.
 
@@ -200,9 +221,11 @@ def _detect_serve_command() -> tuple[str, list[str]]:
     2. **uv project** – ``UV_PROJECT_ENVIRONMENT`` is set, or a ``uv.lock``
        ancestor is found alongside ``sys.executable``, and ``uv`` is on PATH
        → ``uv run code-review-graph serve``
-    3. **uvx** – ``uvx`` is available on PATH (existing behaviour, unchanged)
+    3. **Editable install** – the package was installed from a local checkout
+       → ``sys.executable -m code_review_graph serve``
+    4. **uvx** – ``uvx`` is available on PATH
        → ``uvx code-review-graph serve``
-    4. **Fallback** – use the absolute path of the running Python interpreter
+    5. **Fallback** – use the absolute path of the running Python interpreter
        → ``sys.executable -m code_review_graph serve``
 
     The fallback is always safe: ``sys.executable`` is the exact interpreter
@@ -221,11 +244,16 @@ def _detect_serve_command() -> tuple[str, list[str]]:
         if uv:
             return ("uv", ["run", "code-review-graph", "serve"])
 
-    # 3. uvx global tool runner (existing behaviour, unchanged)
+    # 3. Editable installs must keep using the local checkout. Falling through
+    # to uvx would fetch the public package instead of the patched source.
+    if _installed_editably():
+        return (sys.executable, ["-m", "code_review_graph", "serve"])
+
+    # 4. uvx global tool runner
     if shutil.which("uvx"):
         return ("uvx", ["code-review-graph", "serve"])
 
-    # 4. Absolute-path fallback using the running interpreter
+    # 5. Absolute-path fallback using the running interpreter
     return (sys.executable, ["-m", "code_review_graph", "serve"])
 
 
@@ -235,9 +263,11 @@ def _build_server_entry(
     """Build the MCP server entry for a platform."""
     command, args = _detect_serve_command()
     entry: dict[str, Any] = {"command": command, "args": args}
-    # Include cwd so the MCP server can find the graph database
+    # Keep repo-local and global configs worktree-safe. A pinned absolute cwd
+    # makes one checkout's MCP server inspect the wrong repo from sibling
+    # worktrees; "." lets the client launch the server from the active project.
     if repo_root is not None:
-        entry["cwd"] = str(repo_root)
+        entry["cwd"] = "."
     if plat["needs_type"]:
         entry["type"] = "stdio"
     if key == "opencode":
@@ -263,18 +293,35 @@ def _merge_toml_mcp_server(
     server_entry: dict[str, Any],
     dry_run: bool = False,
 ) -> bool:
-    """Append a Codex MCP server section without clobbering the rest of the file."""
+    """Add or refresh a Codex MCP server section without clobbering other sections."""
     section_header = f"[mcp_servers.{server_name}]"
     existing = ""
-    if config_path.exists():
-        existing = config_path.read_text(encoding="utf-8")
-        if section_header in existing:
-            return False
-
     section_lines = [section_header]
     for key, value in server_entry.items():
         section_lines.append(f"{key} = {_format_toml_value(value)}")
     section = "\n".join(section_lines) + "\n"
+
+    if config_path.exists():
+        existing = config_path.read_text(encoding="utf-8")
+        if section_header in existing:
+            start = existing.index(section_header)
+            next_section = re.search(r"(?m)^\[", existing[start + len(section_header):])
+            end = (
+                start + len(section_header) + next_section.start()
+                if next_section
+                else len(existing)
+            )
+            current_section = existing[start:end].strip()
+            if current_section == section.strip():
+                return False
+            if dry_run:
+                return True
+            suffix = existing[end:]
+            if suffix and not suffix.startswith("\n"):
+                suffix = "\n" + suffix
+            updated = existing[:start] + section + suffix
+            config_path.write_text(updated, encoding="utf-8")
+            return True
 
     if dry_run:
         return True
@@ -287,6 +334,49 @@ def _merge_toml_mcp_server(
             prefix += "\n"
     config_path.write_text(prefix + section, encoding="utf-8")
     return True
+
+
+def _server_entry_matches(existing: Any, expected: dict[str, Any]) -> bool:
+    """Return True when an existing MCP entry already matches what we install."""
+    if not isinstance(existing, dict):
+        return False
+    return all(existing.get(key) == value for key, value in expected.items())
+
+
+def _server_entry_looks_like_crg(existing: Any) -> bool:
+    """Return True for older repo-local entries generated by this installer."""
+    if not isinstance(existing, dict):
+        return False
+    command = str(existing.get("command", ""))
+    args = existing.get("args", [])
+    joined_args = " ".join(str(arg) for arg in args) if isinstance(args, list) else ""
+    return (
+        command.endswith("code-review-graph")
+        or command.endswith("/python")
+        or command.endswith("/python3")
+        or "code_review_graph" in joined_args
+        or "code-review-graph" in joined_args
+    )
+
+
+def _server_name_for_platform(key: str, plat: dict[str, Any]) -> str:
+    """Return the MCP server name to install for a platform."""
+    return str(plat.get("server_name") or "code-review-graph")
+
+
+def _filter_auto_detected_platforms(
+    platforms_to_install: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Remove auto-detected platform pairs that conflict in the same repo."""
+    filtered = dict(platforms_to_install)
+    # Codex reads repo-local .mcp.json in addition to ~/.codex/config.toml.
+    # Installing Claude's repo-local server during `install --platform all`
+    # therefore starts two equivalent MCP servers in Codex worktree sessions,
+    # which can stall /review before the MCP tool call is dispatched. Keep
+    # explicit `--platform claude` installs intact; only auto-detect mode skips.
+    if "codex" in filtered and "claude" in filtered:
+        filtered.pop("claude", None)
+    return filtered
 
 
 def install_platform_configs(
@@ -309,6 +399,7 @@ def install_platform_configs(
         # Workspace-level Kiro detection
         if "kiro" not in platforms_to_install and (repo_root / ".kiro").is_dir():
             platforms_to_install["kiro"] = PLATFORMS["kiro"]
+        platforms_to_install = _filter_auto_detected_platforms(platforms_to_install)
     else:
         if target not in PLATFORMS:
             logger.error("Unknown platform: %s", target)
@@ -321,11 +412,12 @@ def install_platform_configs(
         config_path: Path = plat["config_path"](repo_root)
         server_key = plat["key"]
         server_entry = _build_server_entry(plat, key=key, repo_root=repo_root)
+        server_name = _server_name_for_platform(key, plat)
 
         if plat["format"] == "toml":
             changed = _merge_toml_mcp_server(
                 config_path,
-                "code-review-graph",
+                server_name,
                 server_entry,
                 dry_run=dry_run,
             )
@@ -360,23 +452,40 @@ def install_platform_configs(
             arr = existing.get(server_key, [])
             if not isinstance(arr, list):
                 arr = []
-            # Check if already present
-            if any(isinstance(s, dict) and s.get("name") == "code-review-graph" for s in arr):
+            arr_entry = {"name": server_name, **server_entry}
+            existing_index = next(
+                (
+                    i for i, item in enumerate(arr)
+                    if isinstance(item, dict) and item.get("name") == server_name
+                ),
+                None,
+            )
+            if (
+                existing_index is not None
+                and _server_entry_matches(arr[existing_index], arr_entry)
+            ):
                 print(f"  {plat['name']}: already configured in {config_path}")
                 configured.append(plat["name"])
                 continue
-            arr_entry = {"name": "code-review-graph", **server_entry}
-            arr.append(arr_entry)
+            if existing_index is None:
+                arr.append(arr_entry)
+            else:
+                arr[existing_index] = arr_entry
             existing[server_key] = arr
         else:
             servers = existing.get(server_key, {})
             if not isinstance(servers, dict):
                 servers = {}
-            if "code-review-graph" in servers:
+            for legacy_name in plat.get("legacy_server_names", []):
+                if legacy_name != server_name and _server_entry_looks_like_crg(
+                    servers.get(legacy_name)
+                ):
+                    servers.pop(legacy_name, None)
+            if _server_entry_matches(servers.get(server_name), server_entry):
                 print(f"  {plat['name']}: already configured in {config_path}")
                 configured.append(plat["name"])
                 continue
-            servers["code-review-graph"] = server_entry
+            servers[server_name] = server_entry
             existing[server_key] = servers
 
         if dry_run:
