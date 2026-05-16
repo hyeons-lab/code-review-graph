@@ -11,10 +11,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import anyio
+import mcp.types as mcp_types
+from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from fastmcp import FastMCP
+from fastmcp.server.context import reset_transport, set_transport
+from mcp.server.lowlevel.server import NotificationOptions
+from mcp.shared.message import SessionMessage
 
 from .graph import GraphStore
 from .incremental import find_project_root, get_db_path, start_watch_thread
@@ -91,6 +98,78 @@ mcp = FastMCP(
 )
 
 
+@asynccontextmanager
+async def _stdio_server_sync_stdin():
+    """Stdio transport that avoids anyio's async file wrapper for stdin."""
+    read_stream_writer: MemoryObjectSendStream[SessionMessage | Exception]
+    read_stream: MemoryObjectReceiveStream[SessionMessage | Exception]
+    write_stream: MemoryObjectSendStream[SessionMessage]
+    write_stream_reader: MemoryObjectReceiveStream[SessionMessage]
+
+    read_stream_writer, read_stream = anyio.create_memory_object_stream(100)
+    write_stream, write_stream_reader = anyio.create_memory_object_stream(100)
+
+    async def stdin_reader() -> None:
+        try:
+            async with read_stream_writer:
+                while True:
+                    line = await anyio.to_thread.run_sync(sys.stdin.buffer.readline)
+                    if not line:
+                        break
+                    logger.debug("MCP stdio stdin reader received a line")
+                    try:
+                        message = mcp_types.JSONRPCMessage.model_validate_json(
+                            line.decode("utf-8", errors="replace")
+                        )
+                        item: SessionMessage | Exception = SessionMessage(message)
+                    except Exception as exc:
+                        item = exc
+                    await read_stream_writer.send(item)
+                    logger.debug("MCP stdio stdin reader forwarded a message")
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async def stdout_writer() -> None:
+        try:
+            async with write_stream_reader:
+                async for session_message in write_stream_reader:
+                    data = session_message.message.model_dump_json(
+                        by_alias=True, exclude_none=True
+                    )
+                    sys.stdout.write(data + "\n")
+                    sys.stdout.flush()
+        except anyio.ClosedResourceError:
+            await anyio.lowlevel.checkpoint()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stdin_reader)
+        tg.start_soon(stdout_writer)
+        try:
+            yield read_stream, write_stream
+        finally:
+            tg.cancel_scope.cancel()
+
+
+async def _run_stdio_server() -> None:
+    """Run FastMCP over stdio using the local sync-stdin transport."""
+    token = set_transport("stdio")
+    try:
+        async with mcp._lifespan_manager():
+            async with _stdio_server_sync_stdin() as (read_stream, write_stream):
+                logger.info(
+                    "Starting MCP server 'code-review-graph' with transport 'stdio'"
+                )
+                await mcp._mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    mcp._mcp_server.create_initialization_options(
+                        notification_options=NotificationOptions(tools_changed=True),
+                    ),
+                )
+    finally:
+        reset_transport(token)
+
+
 @mcp.tool()
 async def build_or_update_graph_tool(
     full_rebuild: bool = False,
@@ -161,7 +240,7 @@ async def run_postprocess_tool(
 
 
 @mcp.tool()
-def get_minimal_context_tool(
+async def get_minimal_context_tool(
     task: str = "",
     changed_files: Optional[list[str]] = None,
     repo_root: Optional[str] = None,
@@ -179,14 +258,17 @@ def get_minimal_context_tool(
         repo_root: Repository root path. Auto-detected if omitted.
         base: Git ref for diff comparison. Default: HEAD~1.
     """
-    return get_minimal_context(
-        task=task, changed_files=changed_files,
-        repo_root=_resolve_repo_root(repo_root), base=base,
+    return await asyncio.to_thread(
+        get_minimal_context,
+        task=task,
+        changed_files=changed_files,
+        repo_root=_resolve_repo_root(repo_root),
+        base=base,
     )
 
 
 @mcp.tool()
-def get_impact_radius_tool(
+async def get_impact_radius_tool(
     changed_files: Optional[list[str]] = None,
     max_depth: int = 2,
     repo_root: Optional[str] = None,
@@ -205,9 +287,13 @@ def get_impact_radius_tool(
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         detail_level: "standard" for full output, "minimal" for compact summary. Default: standard.
     """
-    return get_impact_radius(
-        changed_files=changed_files, max_depth=max_depth,
-        repo_root=_resolve_repo_root(repo_root), base=base, detail_level=detail_level,
+    return await asyncio.to_thread(
+        get_impact_radius,
+        changed_files=changed_files,
+        max_depth=max_depth,
+        repo_root=_resolve_repo_root(repo_root),
+        base=base,
+        detail_level=detail_level,
     )
 
 
@@ -243,7 +329,7 @@ def query_graph_tool(
 
 
 @mcp.tool()
-def get_review_context_tool(
+async def get_review_context_tool(
     changed_files: Optional[list[str]] = None,
     max_depth: int = 2,
     include_source: bool = True,
@@ -267,10 +353,15 @@ def get_review_context_tool(
         detail_level: "standard" for full output, "minimal" for
             token-efficient summary. Default: standard.
     """
-    return get_review_context(
-        changed_files=changed_files, max_depth=max_depth,
-        include_source=include_source, max_lines_per_file=max_lines_per_file,
-        repo_root=_resolve_repo_root(repo_root), base=base, detail_level=detail_level,
+    return await asyncio.to_thread(
+        get_review_context,
+        changed_files=changed_files,
+        max_depth=max_depth,
+        include_source=include_source,
+        max_lines_per_file=max_lines_per_file,
+        repo_root=_resolve_repo_root(repo_root),
+        base=base,
+        detail_level=detail_level,
     )
 
 
@@ -471,7 +562,7 @@ def get_flow_tool(
 
 
 @mcp.tool()
-def get_affected_flows_tool(
+async def get_affected_flows_tool(
     changed_files: Optional[list[str]] = None,
     base: str = "HEAD~1",
     repo_root: Optional[str] = None,
@@ -487,8 +578,11 @@ def get_affected_flows_tool(
         base: Git ref for auto-detecting changes. Default: HEAD~1.
         repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_affected_flows_func(
-        changed_files=changed_files, base=base, repo_root=_resolve_repo_root(repo_root),
+    return await asyncio.to_thread(
+        get_affected_flows_func,
+        changed_files=changed_files,
+        base=base,
+        repo_root=_resolve_repo_root(repo_root),
     )
 
 
@@ -1029,7 +1123,7 @@ def main(
         if transport == "stdio":
             # Stdio MCP must keep stdout strictly JSON-RPC. FastMCP's banner/update
             # notices corrupt the handshake stream on clients like Codex CLI.
-            mcp.run(transport="stdio", show_banner=False)
+            anyio.run(_run_stdio_server)
         elif transport == "streamable-http":
             if host is None or port is None:
                 raise ValueError("streamable-http transport requires host and port")

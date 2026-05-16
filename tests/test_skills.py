@@ -503,6 +503,7 @@ class TestInstallPlatformConfigs:
         entry = data["mcp_servers"]["code-review-graph"]
         assert entry["type"] == "stdio"
         assert "serve" in entry["args"]
+        assert entry["cwd"] == "."
 
     @_needs_tomllib
     def test_install_codex_preserves_existing_toml(self, tmp_path):
@@ -538,6 +539,7 @@ class TestInstallPlatformConfigs:
                     "[mcp_servers.code-review-graph]",
                     'command = "uvx"',
                     'args = ["code-review-graph", "serve"]',
+                    'cwd = "/tmp/old-checkout"',
                     'type = "stdio"',
                     "",
                 ]
@@ -556,6 +558,10 @@ class TestInstallPlatformConfigs:
         ):
             install_platform_configs(tmp_path, target="codex")
         assert codex_config.read_text().count("[mcp_servers.code-review-graph]") == 1
+        data = tomllib.loads(codex_config.read_text())
+        entry = data["mcp_servers"]["code-review-graph"]
+        assert entry["cwd"] == "."
+        assert entry["args"] != ["code-review-graph", "serve"]
 
     def test_install_cursor_config(self, tmp_path):
         with patch.dict(
@@ -664,7 +670,7 @@ class TestInstallPlatformConfigs:
 
     def test_install_qwen_config(self, tmp_path):
         """Qwen Code uses ~/.qwen/settings.json with mcpServers (see #83)."""
-        qwen_config = tmp_path / ".qwen" / "settings.json"
+        qwen_config = tmp_path.parent / "home" / ".qwen" / "settings.json"
         with patch.dict(
             PLATFORMS,
             {
@@ -708,6 +714,7 @@ class TestInstallPlatformConfigs:
     def test_install_all_detected(self, tmp_path):
         """Installing 'all' configures auto-detected platforms."""
         codex_config = tmp_path / ".codex" / "config.toml"
+        qwen_config = tmp_path.parent / "home" / ".qwen" / "settings.json"
         with patch.dict(
             PLATFORMS,
             {
@@ -718,6 +725,40 @@ class TestInstallPlatformConfigs:
                 },
                 "claude": {**PLATFORMS["claude"], "detect": lambda: True},
                 "opencode": {**PLATFORMS["opencode"], "detect": lambda: True},
+                "qoder": {**PLATFORMS["qoder"], "detect": lambda: True},
+                "cursor": {**PLATFORMS["cursor"], "detect": lambda: False},
+                "windsurf": {**PLATFORMS["windsurf"], "detect": lambda: False},
+                "zed": {**PLATFORMS["zed"], "detect": lambda: False},
+                "continue": {**PLATFORMS["continue"], "detect": lambda: False},
+                "antigravity": {**PLATFORMS["antigravity"], "detect": lambda: False},
+                "gemini-cli": {**PLATFORMS["gemini-cli"], "detect": lambda: False},
+                "qwen": {
+                    **PLATFORMS["qwen"],
+                    "config_path": lambda root: qwen_config,
+                    "detect": lambda: True,
+                },
+            },
+        ):
+            configured = install_platform_configs(tmp_path, target="all")
+        assert "Codex" in configured
+        assert "Claude Code" not in configured
+        assert "OpenCode" not in configured
+        assert "Qoder" not in configured
+        assert "Qwen Code" in configured
+        assert codex_config.exists()
+        assert not (tmp_path / ".mcp.json").exists()
+        assert not (tmp_path / ".opencode.json").exists()
+        assert not (tmp_path / ".qoder" / "mcp.json").exists()
+        assert qwen_config.exists()
+
+    def test_install_all_keeps_claude_when_codex_not_detected(self, tmp_path):
+        """Auto-detected Claude installs still work when Codex is absent."""
+        with patch.dict(
+            PLATFORMS,
+            {
+                "codex": {**PLATFORMS["codex"], "detect": lambda: False},
+                "claude": {**PLATFORMS["claude"], "detect": lambda: True},
+                "opencode": {**PLATFORMS["opencode"], "detect": lambda: False},
                 "cursor": {**PLATFORMS["cursor"], "detect": lambda: False},
                 "windsurf": {**PLATFORMS["windsurf"], "detect": lambda: False},
                 "zed": {**PLATFORMS["zed"], "detect": lambda: False},
@@ -727,12 +768,9 @@ class TestInstallPlatformConfigs:
             },
         ):
             configured = install_platform_configs(tmp_path, target="all")
-        assert "Codex" in configured
         assert "Claude Code" in configured
-        assert "OpenCode" in configured
-        assert codex_config.exists()
-        assert (tmp_path / ".mcp.json").exists()
-        assert (tmp_path / ".opencode.json").exists()
+        mcp_data = json.loads((tmp_path / ".mcp.json").read_text())
+        assert "code-review-graph-local" in mcp_data["mcpServers"]
 
     def test_merge_existing_servers(self, tmp_path):
         """Should not overwrite existing MCP servers."""
@@ -742,7 +780,40 @@ class TestInstallPlatformConfigs:
         install_platform_configs(tmp_path, target="claude")
         data = json.loads(mcp_path.read_text())
         assert "other-server" in data["mcpServers"]
-        assert "code-review-graph" in data["mcpServers"]
+        assert "code-review-graph-local" in data["mcpServers"]
+        assert "code-review-graph" not in data["mcpServers"]
+
+    def test_refreshes_stale_object_server_entry(self, tmp_path, monkeypatch):
+        """Existing repo-local entries are updated when the launch command changes."""
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(
+            json.dumps({
+                "mcpServers": {
+                    "code-review-graph": {
+                        "command": "uvx",
+                        "args": ["code-review-graph", "serve"],
+                        "cwd": ".",
+                        "type": "stdio",
+                    },
+                    "other-server": {"command": "other"},
+                }
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "code_review_graph.skills._detect_serve_command",
+            lambda: ("code-review-graph", ["serve"]),
+        )
+
+        install_platform_configs(tmp_path, target="claude")
+
+        data = json.loads(mcp_path.read_text())
+        entry = data["mcpServers"]["code-review-graph-local"]
+        assert entry["command"] == "code-review-graph"
+        assert entry["args"] == ["serve"]
+        assert entry["cwd"] == "."
+        assert "code-review-graph" not in data["mcpServers"]
+        assert data["mcpServers"]["other-server"]["command"] == "other"
 
     def test_dry_run_no_write(self, tmp_path):
         configured = install_platform_configs(tmp_path, target="claude", dry_run=True)
@@ -774,6 +845,7 @@ class TestInstallPlatformConfigs:
             install_platform_configs(tmp_path, target="continue")
         data = json.loads(config_path.read_text())
         assert len(data["mcpServers"]) == 1
+        assert data["mcpServers"][0]["args"] != ["serve"]
 
     def test_install_qoder_config(self, tmp_path):
         qoder_config = tmp_path / ".qoder" / "mcp.json"
@@ -1318,6 +1390,7 @@ class TestDetectServeCommand:
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
         monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
         monkeypatch.setattr("code_review_graph.skills._in_uv_project", lambda: False)
+        monkeypatch.setattr("code_review_graph.skills._installed_editably", lambda: False)
         # poetry not on PATH → should fall through to uvx
         monkeypatch.setattr(
             "code_review_graph.skills.shutil.which",
@@ -1360,11 +1433,12 @@ class TestDetectServeCommand:
         assert args == ["run", "code-review-graph", "serve"]
 
     def test_uvx_fallback(self, monkeypatch):
-        """Not in Poetry/uv but uvx available → use uvx (original behaviour)."""
+        """Not in Poetry/uv but uvx available → use uvx."""
         monkeypatch.delenv("POETRY_ACTIVE", raising=False)
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
         monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
         monkeypatch.setattr("code_review_graph.skills._in_uv_project", lambda: False)
+        monkeypatch.setattr("code_review_graph.skills._installed_editably", lambda: False)
         monkeypatch.setattr(
             "code_review_graph.skills.shutil.which",
             lambda x: "/usr/bin/uvx" if x == "uvx" else None,
@@ -1373,12 +1447,30 @@ class TestDetectServeCommand:
         assert cmd == "uvx"
         assert args == ["code-review-graph", "serve"]
 
+    def test_editable_install_takes_priority_over_uvx(self, monkeypatch):
+        """Editable installs keep MCP pointed at the local checkout."""
+        monkeypatch.delenv("POETRY_ACTIVE", raising=False)
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+        monkeypatch.setattr("code_review_graph.skills._in_uv_project", lambda: False)
+        monkeypatch.setattr("code_review_graph.skills._installed_editably", lambda: True)
+        monkeypatch.setattr(
+            "code_review_graph.skills.shutil.which",
+            lambda x: "/usr/bin/uvx" if x == "uvx" else None,
+        )
+
+        cmd, args = _detect_serve_command()
+
+        assert cmd == sys.executable
+        assert args == ["-m", "code_review_graph", "serve"]
+
     def test_sys_executable_fallback(self, monkeypatch):
         """Nothing else available → fall back to sys.executable -m."""
         monkeypatch.delenv("POETRY_ACTIVE", raising=False)
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
         monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
         monkeypatch.setattr("code_review_graph.skills._in_uv_project", lambda: False)
+        monkeypatch.setattr("code_review_graph.skills._installed_editably", lambda: False)
         monkeypatch.setattr("code_review_graph.skills.shutil.which", lambda _: None)
         cmd, args = _detect_serve_command()
         assert cmd == sys.executable
